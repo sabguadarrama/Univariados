@@ -1,0 +1,378 @@
+---
+title: "Codigo ARIMA"
+author: "Sabrina Guadarrama"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F, fig.align="center")
+```
+
+# ARIMA
+Se comienza cargando las paqueterías necesarias, definiendo la ruta del archivo del cual se extraeran las series de tiempo, así como seleccionando el sector a estimar. Para obtener los sectores de manufactura, comercio o transporte se puede asignar a la variable sector (línea 36), el número del sector (31,32 o 33; 43 o 46; 48 o 49) o su nombre en minúsculas.
+```{r}
+# Limpiar ambiente
+rm(list=ls())
+
+# Cargar paqueterías
+library(readxl)      #Leer archivos xls
+library(dplyr)       #Manejar datos
+library(forecast)    #Aplicar funciones: forecast, auto.arima, Arima, checkresiduals
+library(fUnitRoots)  #Aplicar función adfTest para prueba Dickey-Fuller
+library(lmtest)      #Aplicar funciones: coeftest, bgtest, bptest
+library(stats)       #Aplicar función shapiro.test
+library(strucchange) #Realizar cambio estructural
+library(zoo)         #Aplicar función as.yearmon
+
+documento <- "Nombre_del_archivo.xlsx"
+hoja <-  "Hoja"
+sector<-71
+comienzo<-c(2013,1)
+clases_estimar<-c(713291,711410,713111,713941,713120)
+```
+
+```{r}
+clase_no_igae <- c(112511, 112512, 113110, 113211, 113212, 113310, 114111, 114112, 114113, 114119, 114210, 
+                   115310, 522310, 522320, 522390, 522440, 522451, 522452, 522460, 522490, 522510, 523910, 523990,
+                   524120, 524130, 524210, 524220, 531311, 531319, 532210, 532310, 541711, 541712, 541721, 541722,
+                   551111, 551112, 561410, 561421, 561422, 561431, 561432, 561440, 561450, 561490, 561990, 621211,
+                   621212, 621411, 621421, 621491, 621610, 621910, 621991, 621992, 622211, 622311, 622312, 623111,
+                   623211, 623212, 623221, 624111, 624112, 624121, 624191, 624198, 624199, 624211, 624221, 624231,
+                   624311, 624411, 624412, 711111, 711121, 711131, 711191, 711510, 813210, 813220)
+```
+
+
+Primero se lee el archivo, posteriormente, se separan las clases y se suma el sector.
+```{r}
+df<-read_excel(documento, sheet=hoja)
+
+extrae <- function(nscian){
+  colnames(df)<-c("Clave",1:ncol(df))
+  
+  if(sector == 31 | sector == 32 | sector == 33 | sector == "manufactura"){
+    df<-rbind(df[grepl(paste0("^",31),df$Clave),],df[grepl(paste0("^",32),df$Clave),], 
+               df[grepl(paste0("^",33),df$Clave),])
+    sector <- "31_33"
+  } else if(sector == 43 | sector == 46 | sector == "comercio"){
+    df<-rbind(df[grepl(paste0("^",43),df$Clave),],df[grepl(paste0("^",46),df$Clave),])
+    sector <- "43_46"
+  } else if(sector == 48 | sector == 49 | sector == "transporte"){
+    df<-rbind(df[grepl(paste0("^",48),df$Clave),],df[grepl(paste0("^",49),df$Clave),])
+    sector <- "48_49"
+  } else if(sector == "igae" | sector == "IGAE"){
+    df<- df[! df$Clave %in% clase_no_igae,]
+    sector <- "igae"
+  } else {
+    df<-df[grepl(paste0("^",sector),df$Clave),]
+  }
+  
+  clases<-t(df[,1])
+  df<-ts(t(df[,2:length(df)]), start = 1993, frequency=12)
+  df<-window(df, comienzo)
+  assign(paste0("s",sector),ts(rowSums(df),start=comienzo,frequency=12))
+  df<-cbind(df,Sector=rowSums(df))
+  colnames(df)[1:length(clases)]<-clases
+  
+  df<-as.data.frame(df) %>% select(c(as.character(clases_estimar),"Sector"))
+  df<-ts(df,start=comienzo, frequency=12)
+  
+  return(df)
+}
+
+df <- extrae(sector)
+```
+
+Función de cambio estructural por constante y constante-tendencia, extrae los 5 quiebres de cada uno, en vez del óptimo, definido en m (comentado).
+```{r}
+cambio_estructural <- function(st, h, breaks){
+  ## Cálculo de los puntos de cambio estructural (en media) dado h y breaks
+  bp.st <- breakpoints(log(st) ~ 1, h = h, breaks = breaks)
+  # Resumen de resultados
+  su <- summary(bp.st)
+  # Número optimo de puntos de quiebre de acuerdo al criterio BIC 
+  #m <- which.min(su$RSS[2,]) - 1
+  # Fechas de cambio estructural
+  fechas1 <- breakdates(bp.st, format.times = TRUE, breaks = 5)
+  
+  
+  ## Cálculo de los puntos de cambio estructural (constante + tendencia) dado h y breaks
+  t <- seq(1:length(st))
+  t <- ts(t, start = comienzo, frequency = 12)
+  
+  bp.st <- breakpoints(log(st) ~ 1+ t, h = h, breaks = breaks)
+  # Resumen de resultados
+  su <- summary(bp.st)
+  # Número optimo de puntos de quiebre de acuerdo al criterio BIC 
+  #m <- which.min(su$RSS[2,]) - 1
+  # Fechas de cambio estructural
+  fechas2 <- breakdates(bp.st, format.times = TRUE, breaks = 5)
+  
+  # La función devuelve una lista con las fechas de cambio estructural
+  lista <- list(Media=rev(fechas1), Const_Tendencia=rev(fechas2))
+  return(lista)
+}
+```
+
+Utiliza las fechas únicas marcadas en los quiebres para cortar el df por clase. Aquellas menores a 30 observaciones las vuelve dummies. 
+```{r}
+quiebres <- function(clase, ce){
+  df0 <- df[,clase]
+  fechas <- data.frame()
+  for (q in 1:length(ce$Media)) {
+    fechas<-rbind(fechas, as.numeric(strsplit(ce$Media, "\\(|\\)")[[q]]))
+  }
+  for (q in 1:length(ce$Const_Tendencia)) {
+    fechas<-rbind(fechas, as.numeric(strsplit(ce$Const_Tendencia, "\\(|\\)")[[q]]))
+  }
+  fechas<-unique(fechas)
+  for(q in 1:nrow(fechas)){
+    if(fechas[q,2]==12){
+      fechas[q,1]<-fechas[q,1]+1
+      fechas[q,2]<-1
+    }else{
+      fechas[q,2]<-fechas[q,2]+1
+    }
+    
+    f_corte <- c(fechas[q,1:2][[1]],fechas[q,1:2][[2]])
+    if(length(window(df[,clase],f_corte))>30){
+      assign(paste0("df",q), window(df[,clase], f_corte))
+    } else {
+      assign(paste0("dummy",f_corte[1],f_corte[2]),round(time(df[,clase]),2)==round((f_corte[1]+(f_corte[2]-1)/12),2))
+    }
+  }
+  dfs <- mget(ls(pattern = "^df\\d+$"))
+  
+  assign(paste0("dummy",2020,04),round(time(df[,clase]),2)==round((2020+(4-1)/12),2))
+  dummies <- t(do.call(mapply, c(FUN = c, mget(ls(pattern = "^dummy\\d+$")))))
+  dummies <- replace(dummies, dummies=="TRUE",1)
+  dummies <- ts(dummies, start=comienzo, frequency=12)
+  
+  return(list(Data_Frames = dfs, Dummy_Frame = dummies))
+}
+```
+
+
+```{r echo=FALSE}
+Selec_Arima <- data.frame()
+Selec_pruebas <- data.frame()
+Pronostico <- data.frame()
+dfs_pronost <- list()
+```
+
+Primera función, remueve los terminos que no sean significativos de uno por uno.
+```{r}
+estimacion<-function(clase, m){
+  tryCatch({
+    if(adfTest(dfs$Data_Frames[[m]], type="nc")@test$p.value>0.05){
+      datos<-diff(log(dfs$Data_Frames[[m]]))
+      dummies <- window(dfs$Dummy_Frame,(time(dfs$Data_Frames[[m]])[1]+1/12))
+      modelo2 <- auto.arima(datos, max.d=0, max.P=1, max.Q = 1, max.D = 0, 
+                            ic="bic", stepwise = FALSE, method="ML", xreg=dummies)
+      print(paste0(colnames(df)[clase]," diferencia del log"))
+    }else{
+      datos<-log(dfs$Data_Frames[[m]])
+      dummies <- window(dfs$Dummy_Frame,(time(dfs$Data_Frames[[m]])[1]))
+      modelo2 <- auto.arima(datos, max.d=1, max.P=1, max.Q = 1, max.D = 0, 
+                            ic="bic", stepwise = FALSE, method="ML", xreg=dummies)
+    }
+    
+    nobsv<- length(dfs$Data_Frames[[m]])
+    
+    valores_iniciales <- coeftest(modelo2)
+    valores <- valores_iniciales
+    
+    # Prueba Breusch-Godfrey para autocorrelación
+    ac <- bgtest(lm(residuals(modelo2)~1),order=2)
+      
+    # Prueba Shapiro-Wilk para normalidad
+    nst <- shapiro.test(residuals(modelo2))
+    
+    fdummies <- rbind(rep(0,ncol(dummies)))
+    colnames(fdummies) <- colnames(dummies)
+    
+    fc <- forecast(modelo2, h=1, xreg=fdummies)
+    y_pronosticada <- ts(c(exp(fc$fitted),exp(fc$mean)),start=time(dfs$Data_Frames[[m]])[1],frequency=12)
+    fc_niv <- exp(fc$mean)
+    
+    # Prueba Breusch-Pagan para heteroscedasticidad
+    het <- bptest(dfs$Data_Frames[[m]][2:nobsv]~y_pronosticada[2:nobsv])
+    
+    
+    x <- 0
+    
+    while (!max(valores[,4])<0.05) {
+      coef_sign <- as.integer(valores_iniciales[,4]<sort(valores_iniciales[,4],partial=length(valores_iniciales[,4])-x)[length(valores_iniciales[,4])-x])
+      terminos_arma <- replace(coef_sign, coef_sign==1,NA)
+      
+      modelo1 <- Arima(datos, 
+                       order = c(modelo2[["arma"]][1],modelo2[["arma"]][6],modelo2[["arma"]][2]),
+                       seasonal = list(order=c(modelo2[["arma"]][3],modelo2[["arma"]][7],modelo2[["arma"]][4])),
+                       method="ML", include.mean=FALSE, transform.pars = FALSE, fixed = terminos_arma, 
+                       xreg = dummies)
+      valores <- coeftest(modelo1)
+      
+      # Prueba Breusch-Godfrey para autocorrelación
+      ac <- bgtest(lm(residuals(modelo1)~1),order=2)
+      
+      # Prueba Shapiro-Wilk para normalidad
+      nst <- shapiro.test(residuals(modelo1))
+      
+      fc <- forecast(modelo1,h=1, xreg=fdummies)
+    
+      # Prueba Breusch-Pagan para heteroscedasticidad
+      het <- bptest(dfs$Data_Frames[[m]][2:length(dfs$Data_Frames[[m]])]~y_pronosticada[2:length(dfs$Data_Frames[[m]])])
+      
+      x <- x+1
+    }
+    
+    
+    if(adfTest(dfs$Data_Frames[[m]], type="nc")@test$p.value>0.05){
+      y_pronosticada<-ts(dlog_niveles(dfs$Data_Frames[[m]],fc),start=time(dfs$Data_Frames[[m]])[1], frequency=12)
+      fc_niv <- last(y_pronosticada)
+      
+      # Prueba Breusch-Pagan para heteroscedasticidad
+      het <- bptest(dfs$Data_Frames[[m]][2:length(dfs$Data_Frames[[m]])]~y_pronosticada[2:length(dfs$Data_Frames[[m]])])
+    }
+    
+    # Acomodo del data frame de los terminos del Arima
+    if(nrow(valores)==1){
+      valores <- data.frame(Terminos_ARMA = row.names(valores), t(valores[1:nrow(valores),1:ncol(valores)]), Metodo=1)
+    }else{
+      valores <- data.frame(Terminos_ARMA = row.names(valores), valores[1:nrow(valores),1:ncol(valores)], Metodo = 1)
+    }
+    
+    # Data frame de los Pronósticos
+    tanual <- fc_niv/dfs$Data_Frames[[m]][length(dfs$Data_Frames[[m]])-11]*100-100
+    tmes <- fc_niv/last(dfs$Data_Frames[[m]])*100-100
+    pronost <- data.frame(Niveles=fc_niv, VarAnual=tanual, VarMensual=tmes)
+    
+    return(list(Arima=valores,Test=data.frame(Autocorrelación=ac$p.value,Heteroscedasticidad=het$p.value,Normalidad=nst$p.value),forecast=pronost,SeriePronost=y_pronosticada))
+    
+  },error=function(e){cat("ERROR en función 1:", colnames(df)[clase], "\n")
+    return(estimacion2(clase,m))
+  })
+}
+```
+
+Segunda función, elimina todos los terminos no significativos de una sola vez.
+```{r}
+estimacion2<-function(clase,m){
+  tryCatch({
+    if(adfTest(dfs$Data_Frames[[m]], type="nc")@test$p.value>0.05){
+      datos<-diff(log(dfs$Data_Frames[[m]]))
+      dummies <- window(dfs$Dummy_Frame,(time(dfs$Data_Frames[[m]])[1]+1/12))
+      modelo2 <- auto.arima(datos, max.d=0, max.P=1, max.Q = 1, max.D = 0, 
+                            stepwise = FALSE, method="ML", xreg=dummies)
+      print(paste0(colnames(df)[clase]," diferencia del log"))
+    }else{
+      datos<-log(dfs$Data_Frames[[m]])
+      dummies <- window(dfs$Dummy_Frame,(time(dfs$Data_Frames[[m]])[1]))
+      modelo2 <- auto.arima(datos, max.d=1, max.P=1, max.Q = 1, max.D = 0, 
+                            stepwise = FALSE, method="ML", xreg=dummies)
+    }
+    
+    valores_iniciales <- coeftest(modelo2)
+    valores <- valores_iniciales
+    
+    coef_sign <- as.integer(valores_iniciales[,4]<0.05)
+    terminos_arma <- replace(coef_sign, coef_sign==1,NA)
+    
+    # Modelo Arima sin términos no significativos
+    modelo1 <- Arima(datos,
+                     order = c(modelo2[["arma"]][1],modelo2[["arma"]][6],modelo2[["arma"]][2]),
+                     seasonal = list(order=c(modelo2[["arma"]][3],modelo2[["arma"]][7],modelo2[["arma"]][4])),
+                     method="ML", include.mean=FALSE, transform.pars = FALSE, fixed = terminos_arma, xreg = dummies)
+    valores <- coeftest(modelo1)
+    
+    # Prueba Breusch-Godfrey para autocorrelación
+    ac <- bgtest(lm(residuals(modelo1)~1),order=2)
+      
+    # Prueba Shapiro-Wilk para normalidad
+    nst <- shapiro.test(residuals(modelo1))
+    
+    # Acomodo del data frame de los terminos del Arima
+    if(nrow(valores)==1){
+      valores <- data.frame(Terminos_ARMA = row.names(valores), t(valores[1:nrow(valores),1:ncol(valores)]), Metodo=2)
+    } else{
+      valores <- data.frame(Terminos_ARMA = row.names(valores), valores[1:nrow(valores),1:ncol(valores)], Metodo = 2)
+    }
+    
+    fdummies <- rbind(rep(0,ncol(dummies)))
+    colnames(fdummies) <- colnames(dummies)
+    
+    fc <- forecast(modelo1,h=1, xreg=fdummies)
+    y_pronosticada<-rbind(dfs$Data_Frames[[m]][1], exp(fc$fitted), exp(fc$mean))
+    fc_niv <- exp(fc$mean)
+    
+    # Prueba Breusch-Pagan para heteroscedasticidad
+    het <- bptest(dfs$Data_Frames[[m]][2:length(dfs$Data_Frames[[m]])]~y_pronosticada[2:length(dfs$Data_Frames[[m]])])
+    
+    if(adfTest(dfs$Data_Frames[[m]], type="nc")@test$p.value>0.05){
+      y_pronosticada<-ts(dlog_niveles(dfs$Data_Frames[[m]],fc),start=time(dfs$Data_Frames[[m]])[1], frequency=12)
+      fc_niv <- last(y_pronosticada)
+      
+      # Prueba Breusch-Pagan para heteroscedasticidad
+      het <- bptest(df[2:length(dfs$Data_Frames[[m]])]~y_pronosticada[2:length(dfs$Data_Frames[[m]])])
+      het
+    } 
+    
+    # Data frame de los Pronósticos
+    tanual <- fc_niv/dfs$Data_Frames[[m]][length(dfs$Data_Frames[[m]])-11]*100-100
+    tmes <- fc_niv/last(dfs$Data_Frames[[m]])*100-100
+    pronost <- data.frame(Niveles=fc_niv, VarAnual=tanual, VarMensual=tmes)
+    
+    
+    return(list(Arima=valores,Test=data.frame(Autocorrelación=ac$p.value,Heteroscedasticidad=het$p.value,Normalidad=nst$p.value),forecast=pronost, SeriePronost=y_pronosticada))
+    
+  },error=function(e){cat("ERROR en función 2:", colnames(df)[clase], "\n")
+    valores=data.frame(Terminos_ARMA = row.names(valores_iniciales), valores_iniciales[1:nrow(valores_iniciales),1:ncol(valores_iniciales)], Metodo=3)
+    return(list(Arima = valores, Test = data.frame(Autocorrelación=NA,Heteroscedasticidad=NA,Normalidad=NA), forecast = data.frame(Niveles=NA,VarAnual=NA,VarMensual=NA), SeriePronost=NA))
+  })
+}
+```
+
+Función para pasar las series pronosticadas en diferencia de logaritmo a niveles.
+```{r}
+dlog_niveles <- function(orig_niveles, pred_dlog){
+  n<-1
+  transf<-orig_niveles[1]
+  while (n<length(orig_niveles)) {
+   transf<- rbind(transf,exp(pred_dlog$fitted[n]+log(transf[n])))
+   n<-n+1
+  }
+  transf<-rbind(transf,exp(pred_dlog$mean+log(transf[length(transf)])))
+  return(transf)
+}
+```
+
+El siguiente loop corre las funciones generadas anteriormente para las clases y el sector.
+```{r}
+for (clase in 1:ncol(df)) {
+  ce <- cambio_estructural(df[,clase], .10, 5)
+  dfs<- quiebres(clase,ce)
+  
+  for (m in 1:length(dfs$Data_Frames)) {
+    print(paste0(colnames(df)[clase]," periodo: ",as.yearmon(time(dfs$Data_Frames[[m]])[1])))
+    
+    resultado<-estimacion(clase, m)
+    Selec_Arima <- rbind(Selec_Arima, data.frame(resultado$Arima, Clase=colnames(df)[clase],
+                                                 Inicia=as.character(as.yearmon(time(dfs$Data_Frames[[m]])[1]))))
+    Selec_pruebas<-rbind(Selec_pruebas, data.frame(resultado$Test, Clase=colnames(df)[clase],
+                                                   Inicia=as.character(as.yearmon(time(dfs$Data_Frames[[m]])[1]))))
+    Pronostico <- rbind(Pronostico, data.frame(resultado$forecast, Clase=colnames(df)[clase],
+                                               Inicia=as.character(as.yearmon(time(dfs$Data_Frames[[m]])[1]))))
+    
+    serie <- resultado$SeriePronost
+    dfs_pronost[[paste0(colnames(df)[clase],"_",as.yearmon(time(dfs$Data_Frames[[m]])[1]))]] <- serie
+  }
+}
+```
+
+Se guardan los resultados en un archivo .csv
+```{r}
+write.csv(Pronostico,file="Pronostico71.csv", row.names=FALSE)
+```
+
